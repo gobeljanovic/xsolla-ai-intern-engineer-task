@@ -1,3 +1,20 @@
 spring:
   application:
     name: XsollaTask
+
+app:
+  service:
+    version: 0.1.0
+
+  security:
+    bearer-token: ${APP_BEARER_TOKEN}
+
+  cors:
+    allowed-origins:
+      - ${APP_CORS_ALLOWED_ORIGIN:http://localhost:5173}
+
+  limits:
+    max-payload-bytes: 1048576
+    chunk-bytes: 65536
+    max-concurrent-jobs: 4
+    rate-limit-per-minute: 30
