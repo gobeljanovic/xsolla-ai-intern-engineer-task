@@ -1,7 +1,8 @@
 # AI Diff Review Service
 
-A Spring Boot HTTP service that accepts unified diffs and produces structured
-code-review findings asynchronously.
+A Spring Boot service that accepts unified diffs, reviews them asynchronously,
+and returns deterministic, structured findings through polling and
+Server-Sent Events (SSE).
 
 This project is being developed for the Xsolla AI-First Engineering Intern
 technical assessment.
@@ -10,31 +11,29 @@ technical assessment.
 
 Implemented:
 
-- Public health and service-specification endpoints
-- Stateless bearer-token authentication for `/v1/**`
-- JSON error response for unauthorized requests
-- Configurable CORS policy
-- Configuration-backed service limits
-- Unified-diff parsing into files and added lines
-- New-file line-number tracking for added lines
-- Rejection of malformed unified diffs
-- Finding domain model with contract-compatible IDs
-- Required finding ordering by path, line, and rule ID
-- Provider abstraction for mock and future LLM implementations
-- Deterministic `MOCK-001` eval detection
-- Deterministic `MOCK-002` hardcoded-credential detection
-- Automated tests for parsing, findings, providers, and application startup
+- Public `GET /health` and `GET /spec` endpoints
+- Stateless bearer-token authentication for every `/v1/**` endpoint
+- Configurable CORS policy and contract-compatible JSON error envelopes
+- Unified-diff parsing with correct new-file line numbers
+- All nine deterministic mock-provider rules (`MOCK-001`–`MOCK-008` and
+  `MOCK-INJ`)
+- Finding deduplication, required ordering, and `maxFindings`
+- UTF-8 byte-based 64 KiB chunking on file boundaries
+- Four-worker asynchronous review execution with queued jobs
+- Job polling through `GET /v1/reviews/{jobId}`
+- SSE status, finding, and done events with completed-job replay
+- Raw-body idempotency with conflict detection
+- Concurrent result caching and in-flight request coalescing
+- Graceful failed-job behavior for an unavailable LLM provider
+- 65 passing automated tests
 
-In progress:
+Remaining before submission:
 
-- Remaining deterministic mock-provider rules
-- Finding deduplication, ordering, and `maxFindings`
-- File-boundary chunking
-- Asynchronous review jobs
-- SSE streaming and replay
-- Caching and idempotency
-- Rate limiting
-- Real LLM provider with graceful failure
+- Enforce the 1 MiB request limit with the exact `413 payload_too_large` error
+- Add POST-only rate limiting and `Retry-After`
+- Connect and verify a real LLM provider
+- Add focused HTTP tests for SSE, idempotency, caching, payload size, and bursts
+- Deploy the service and create `SUBMISSION.md`
 
 ## Technology
 
@@ -42,56 +41,62 @@ In progress:
 - Spring Boot 3.3.2
 - Spring MVC
 - Spring Security
-- Maven
+- Maven Wrapper
 
-The versions above describe the current source code and should be updated if
-the runtime is upgraded.
-
-## Current architecture
-
-The review logic is separated into small layers:
+## Architecture
 
 ```text
-Raw unified diff
+POST /v1/reviews
+        |
+        +-- raw body --> idempotency registry
         |
         v
-UnifiedDiffParser
-        |
-        v
-ParsedDiff
-  +-- DiffFile
-        +-- AddedLine
-        |
-        v
-ReviewProvider
-        |
-        +-- MockReviewProvider
-        +-- LlmReviewProvider (planned)
-        |
-        v
-Finding objects
+UnifiedDiffParser --> ParsedDiff --> DiffChunker
+                                      |
+                                      v
+                              ReviewPipeline
+                                /         \
+                     MockReviewProvider  LlmReviewProvider
+                                      |
+                                      v
+                            ordered Findings
+                                      |
+                         result cache + ReviewJob
+                              /               \
+                    polling endpoint       SSE stream/replay
 ```
 
-`UnifiedDiffParser` owns knowledge of unified-diff syntax. Providers operate on
-structured files and added lines, so they do not need to interpret raw diff
-headers or calculate line numbers.
+The parser owns unified-diff syntax and line-number calculation. Providers only
+operate on structured diff data. `ReviewPipeline` owns chunking, deduplication,
+ordering, and truncation, keeping those rules identical for every provider.
 
-`ReviewProvider` separates the review pipeline from a specific provider. The
-deterministic mock provider is being implemented first because it is the scored
-behavior and can be verified without an external service.
+`ReviewJobService` creates a job immediately and runs uncached work on a fixed
+four-thread executor. Job state and SSE history are stored in memory. A
+separate SSE executor prevents event replay from consuming review-worker
+capacity.
 
-HTTP controllers, asynchronous job management, caching, and SSE streaming will
-be built around this domain layer after the deterministic review behavior is
-complete.
+Idempotency and caching solve different problems:
+
+- `Idempotency-Key` maps one raw request body to one job ID. Reusing the key
+  with a different body returns `409`.
+- The result cache is keyed by diff, provider, and `maxFindings`. A repeated
+  review gets a new job ID but reuses the computation and reports
+  `cacheHit: true`.
+- Cache entries contain `CompletableFuture` results, so simultaneous identical
+  submissions share one provider execution instead of occupying multiple
+  workers.
+
+Jobs, idempotency records, event history, and cached results are currently
+in-memory and are cleared whenever the application restarts.
 
 ## Running locally
 
-The Maven project is located in the `XsollaTask` directory.
+The Maven application is located in the `XsollaTask` directory.
 
 ### Prerequisites
 
-- Java 17
-- No separate Maven installation is required; the Maven Wrapper is included.
+- JDK 17
+- No separate Maven installation is required
 
 ### Environment variables
 
@@ -100,16 +105,13 @@ The Maven project is located in the `XsollaTask` directory.
 | `APP_BEARER_TOKEN` | Yes | None | Token accepted by protected `/v1/**` routes |
 | `APP_CORS_ALLOWED_ORIGIN` | No | `http://localhost:5173` | Browser origin allowed by CORS |
 
-The bearer token must be supplied externally. Never commit a production token
-to the repository.
+Never commit a production bearer token or an LLM credential.
 
 ### Windows PowerShell
 
 ```powershell
 cd XsollaTask
-
 $env:APP_BEARER_TOKEN = "local-development-token-change-me"
-
 .\mvnw.cmd spring-boot:run
 ```
 
@@ -117,81 +119,29 @@ $env:APP_BEARER_TOKEN = "local-development-token-change-me"
 
 ```bash
 cd XsollaTask
-
 export APP_BEARER_TOKEN="local-development-token-change-me"
-
 ./mvnw spring-boot:run
 ```
 
 The service starts at `http://localhost:8080`.
 
-## Public endpoints
+## API
 
-### `GET /health`
+### Public endpoints
 
-Does not require authentication.
+`GET /health` returns service status, version, and uptime. `GET /spec` returns
+the provider list and configured limits. Neither endpoint requires
+authentication.
 
-```bash
-curl http://localhost:8080/health
-```
+### Authentication
 
-Example response:
-
-```json
-{
-  "status": "ok",
-  "version": "0.1.0",
-  "uptimeSeconds": 12
-}
-```
-
-### `GET /spec`
-
-Does not require authentication.
-
-```bash
-curl http://localhost:8080/spec
-```
-
-Example response:
-
-```json
-{
-  "specVersion": "1.0",
-  "providers": ["mock", "llm"],
-  "limits": {
-    "maxPayloadBytes": 1048576,
-    "chunkBytes": 65536,
-    "maxConcurrentJobs": 4,
-    "rateLimitPerMinute": 30
-  }
-}
-```
-
-The limits returned by `/spec` come from the same typed configuration that
-will be used by the corresponding runtime components.
-
-## Authentication
-
-Every route under `/v1/**` requires:
+Every `/v1/**` request requires:
 
 ```http
 Authorization: Bearer <token>
 ```
 
-Example:
-
-```bash
-curl \
-  -H "Authorization: Bearer local-development-token-change-me" \
-  http://localhost:8080/v1/reviews/example
-```
-
-Until the review routes are implemented, a correct token may produce `404`.
-That means authentication succeeded and Spring MVC could not find the requested
-controller.
-
-Missing, malformed, Basic, or incorrect credentials produce:
+Missing, malformed, Basic, or incorrect credentials return:
 
 ```json
 {
@@ -202,96 +152,110 @@ Missing, malformed, Basic, or incorrect credentials produce:
 }
 ```
 
-The security implementation is deliberately stateless:
+A static opaque token is intentional: the assessment requires one submitted
+token and does not require JWT claims, expiration, issuers, or signing keys.
 
-- No form login
-- No HTTP Basic authentication
-- No server-side session
-- No cookies
-- Every protected request supplies its bearer token
-- The configured token is compared without a simple early-exit string comparison
+### Submit a review
 
-A static opaque token was chosen instead of JWT because the assessment requires
-one submitted bearer token and does not require claims, issuers, expiration,
-or signing-key management.
+```http
+POST /v1/reviews
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: optional-client-key
+```
+
+```json
+{
+  "diff": "--- a/src/app.js\n+++ b/src/app.js\n@@ -1 +1 @@\n-old\n+eval(input);\n",
+  "options": {
+    "provider": "mock",
+    "maxFindings": 100
+  }
+}
+```
+
+Successful submission returns `202 Accepted`:
+
+```json
+{
+  "jobId": "<opaque-id>",
+  "status": "queued"
+}
+```
+
+### Poll a job
+
+```http
+GET /v1/reviews/{jobId}
+Authorization: Bearer <token>
+```
+
+A completed response includes ordered findings and usage:
+
+```json
+{
+  "jobId": "<opaque-id>",
+  "status": "done",
+  "findings": [],
+  "usage": {
+    "inputBytes": 82,
+    "chunks": 1,
+    "cacheHit": false
+  }
+}
+```
+
+### Stream a job
+
+```http
+GET /v1/reviews/{jobId}/stream
+Authorization: Bearer <token>
+Accept: text/event-stream
+```
+
+The stream emits:
+
+- `status` when the job is queued, running, done, or failed
+- `finding` once for every ordered finding
+- `done` with the total and usage, followed by connection completion
+
+Connecting after a job finishes replays its complete in-memory event history.
 
 ## CORS
 
-CORS is configured for browser clients and does not affect Postman, `curl`, or
-server-to-server requests.
+The configured browser origin may use `GET`, `POST`, and preflight `OPTIONS`.
+Allowed headers include `Authorization`, `Content-Type`, `Idempotency-Key`, and
+`Last-Event-ID`; `Retry-After` is exposed. CORS does not affect Postman, curl,
+or server-to-server clients.
 
-The current policy:
+## Verification
 
-- Allows the configured origin
-- Allows `GET`, `POST`, and preflight `OPTIONS`
-- Allows `Authorization`, `Content-Type`, `Idempotency-Key`, and `Last-Event-ID`
-- Exposes `Retry-After`
-- Does not use cookie credentials
-
-## Verification completed so far
-
-The following behaviors were checked manually:
-
-| Request | Expected result |
-|---|---:|
-| `GET /health` without authentication | `200` |
-| `GET /spec` without authentication | `200` |
-| `/v1/**` without authentication | `401` |
-| `/v1/**` with Basic Auth | `401` |
-| `/v1/**` with an incorrect bearer token | `401` |
-| Unknown `/v1/**` with the correct bearer token | `404` |
-
-The automated suite currently verifies:
-
-| Behavior | Verification |
-|---|---|
-| Valid unified diff | Parsed into structured files and added lines |
-| Invalid unified diff | Rejected with `InvalidDiffException` |
-| Finding ID | Generated as `ruleId:path:line` |
-| Finding ordering | Path, then line, then rule ID |
-| `MOCK-001` positive case | Reports `eval(` on an added line |
-| `MOCK-001` negative case | Does not report a line without `eval(` |
-| `MOCK-002` positive case | Detects a case-insensitive hardcoded credential |
-| `MOCK-002` boundary case | Ignores credentials shorter than 16 characters |
-| Spring application context | Starts successfully |
-
-Run the complete test suite from the Maven project directory:
+Run the complete test suite:
 
 ```powershell
 cd XsollaTask
 .\mvnw.cmd clean test
 ```
 
-Current verified result:
+Current result:
 
 ```text
-Tests run: 9, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 65, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
-## Development roadmap
+The suite currently covers diff parsing and line tracking, all deterministic
+mock rules, prompt-injection inertness, finding contracts, ordering,
+deduplication, truncation, file-boundary chunking, job transitions, provider
+failure, asynchronous execution, polling responses, error envelopes, and
+result-cache reuse.
 
-Immediate next checkpoint:
+Manual checks have also covered authentication behavior, POST/poll flow, SSE
+live delivery and completed-job replay, and cache-hit visibility.
 
-1. Implement and test the remaining single-line rules:
-   - `MOCK-005`
-   - `MOCK-006`
-   - `MOCK-007`
-   - `MOCK-008`
-   - `MOCK-INJ`
-2. Implement `MOCK-003` SQL string-concatenation detection.
-3. Implement multiline `MOCK-004` empty-catch detection.
-4. Apply finding deduplication, required ordering, and `maxFindings`.
+## Next checkpoint
 
-Later checkpoints:
-
-1. File-boundary chunking with a 64 KiB limit.
-2. Asynchronous job lifecycle and in-memory job storage.
-3. `POST /v1/reviews` and `GET /v1/reviews/{jobId}`.
-4. SSE live events and replay for completed jobs.
-5. Idempotency and result caching.
-6. Payload validation and exact error taxonomy.
-7. Rate limiting and four-job concurrency.
-8. Real LLM provider with graceful failure.
-9. Contract-level integration tests.
-10. Deployment, final README polish, and `SUBMISSION.md`.
+Implement exact payload-size enforcement first, then POST-only rate limiting.
+After those deterministic contract requirements pass, connect the real LLM
+provider, add contract-level integration tests, deploy, and finish
+`SUBMISSION.md`.

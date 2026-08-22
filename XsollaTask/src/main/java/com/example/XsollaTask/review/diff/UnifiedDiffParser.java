@@ -71,7 +71,7 @@ public final class UnifiedDiffParser {
                 ? normalizePath(oldPath)
                 : normalizePath(newPath);
 
-        List<AddedLine> addedLines = new ArrayList<>();
+        List<NewFileLine> newFileLines  = new ArrayList<>();
         boolean foundHunk = false;
 
         int lineIndex = oldHeaderIndex + 2;
@@ -127,6 +127,12 @@ public final class UnifiedDiffParser {
 
                 switch (prefix) {
                     case ' ' -> {
+                        newFileLines.add(new NewFileLine(
+                                newLineNumber,
+                                hunkLine.substring(1),
+                                false
+                        ));
+
                         oldConsumed++;
                         newConsumed++;
                         newLineNumber++;
@@ -141,9 +147,10 @@ public final class UnifiedDiffParser {
                             );
                         }
 
-                        addedLines.add(new AddedLine(
+                        newFileLines.add(new NewFileLine(
                                 newLineNumber,
-                                hunkLine.substring(1)
+                                hunkLine.substring(1),
+                                true
                         ));
 
                         newConsumed++;
@@ -188,7 +195,7 @@ public final class UnifiedDiffParser {
         return new DiffFile(
                 findingPath,
                 rawDiff.toString(),
-                addedLines
+                newFileLines
         );
     }
 

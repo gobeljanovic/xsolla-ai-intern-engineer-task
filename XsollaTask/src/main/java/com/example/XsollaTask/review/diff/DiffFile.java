@@ -6,13 +6,23 @@ import java.util.Objects;
 public record DiffFile(
         String path,
         String rawDiff,
-        List<AddedLine> addedLines
+        List<NewFileLine> newFileLines
 ) {
     public DiffFile {
         Objects.requireNonNull(path);
         Objects.requireNonNull(rawDiff);
-        Objects.requireNonNull(addedLines);
+        Objects.requireNonNull(newFileLines);
 
-        addedLines = List.copyOf(addedLines);
+        newFileLines = List.copyOf(newFileLines);
+    }
+
+    public List<AddedLine> addedLines() {
+        return newFileLines.stream()
+                .filter(NewFileLine::added)
+                .map(line -> new AddedLine(
+                        line.newLineNumber(),
+                        line.content()
+                ))
+                .toList();
     }
 }
